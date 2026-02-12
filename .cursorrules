@@ -1,0 +1,203 @@
+# MeritMind — Voice Mood Journal for Own Merit
+
+## What This Is
+A voice-first mood journaling app for Own Merit residents (ex-offenders and care leavers in supportive living). Residents have a natural voice conversation with an AI companion at end of day. The conversation transcript is analyzed by MiniMax to extract mood, themes, wins, struggles. Everything is stored in MongoDB and displayed as a mood journal with trends over time.
+
+## Who This Serves
+Own Merit residents: adults rebuilding lives after prison or care. Many have LOW LITERACY. Many are TIRED at end of day. This must be as easy as talking to a friend. NO typing required for the core experience. NEVER clinical, never surveillance, never patronising.
+
+## Tech Stack
+- **Framework**: Next.js 14 App Router, TypeScript strict
+- **Styling**: Tailwind CSS + shadcn/ui — WARM theme, mobile-first
+- **Voice**: ElevenLabs Conversational AI — `@elevenlabs/react` (useConversation hook)
+- **Analysis**: MiniMax LLM API — post-process transcript into structured insights
+- **Database**: MongoDB Atlas + Mongoose
+
+## Critical: ElevenLabs Integration
+
+### Setup
+```bash
+npm install @elevenlabs/react
+```
+
+### The Hook
+```tsx
+import { useConversation } from '@elevenlabs/react';
+
+const conversation = useConversation({
+  onConnect: () => setStatus('connected'),
+  onDisconnect: () => handleConversationEnd(),
+  onMessage: (msg) => {
+    // msg.source: "user" | "ai"
+    // msg.message: string (transcript text)
+    setTranscript(prev => [...prev, {
+      role: msg.source === 'user' ? 'user' : 'agent',
+      text: msg.message,
+      timestamp: Date.now()
+    }]);
+  },
+  onError: (error) => console.error(error),
+});
+
+// Start with signed URL (private agent)
+const startSession = async () => {
+  await navigator.mediaDevices.getUserMedia({ audio: true });
+  const res = await fetch('/api/signed-url');
+  const { signedUrl } = await res.json();
+  await conversation.startSession({ signedUrl });
+};
+
+// Or with public agent (simpler)
+await conversation.startSession({ agentId: process.env.NEXT_PUBLIC_AGENT_ID });
+
+// End session
+await conversation.endSession();
+
+// Useful state
+conversation.status    // "connected" | "disconnected" | "connecting"
+conversation.isSpeaking // boolean — is the agent currently talking?
+```
+
+### Signed URL API Route
+```typescript
+// api/signed-url/route.ts
+export async function GET() {
+  const response = await fetch(
+    `https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${process.env.NEXT_PUBLIC_AGENT_ID}`,
+    { headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY! } }
+  );
+  const data = await response.json();
+  return NextResponse.json({ signedUrl: data.signed_url });
+}
+```
+
+### IMPORTANT: Enable onMessage in ElevenLabs Dashboard
+Go to agent → Advanced tab → enable client events for onMessage. Without this, transcript capture won't work.
+
+## Design Language — MOBILE FIRST
+- Target: 375px width primary, scales up
+- Background: stone-50 (warm cream)
+- Surface: white rounded-2xl shadow-sm border-stone-200
+- Primary: teal-600 (#0D9488)
+- Accent: amber-500 (#F59E0B)
+- Mood colors: emerald-500 (great) → teal-500 (good) → amber-500 (okay) → orange-500 (low) → rose-400 (struggling)
+- Typography: Inter, relaxed line-height, friendly
+- Corners: rounded-2xl EVERYWHERE
+- Tap targets: min 48px — these are phone users
+- Spacing: generous — p-5 on cards, gap-4 on stacks
+- NO dark mode. Warm and light.
+- Animations: gentle fade-in on mount, orb pulsing during conversation
+
+## Project Structure
+```
+src/
+  app/
+    page.tsx                        # Home — user selector + CTA
+    journal/
+      page.tsx                      # Voice conversation session (THE HERO PAGE)
+      [id]/page.tsx                 # View completed journal entry
+    dashboard/
+      page.tsx                      # Mood trends + history
+    api/
+      users/route.ts
+      signed-url/route.ts           # ElevenLabs signed URL
+      journals/route.ts             # POST: save+analyze | GET: list
+      journals/[id]/route.ts        # GET: single entry
+      dashboard/[userId]/route.ts   # Aggregated stats
+      seed/route.ts                 # Demo data
+  lib/
+    mongodb.ts                      # globalThis cached connection
+    minimax.ts                      # analyzeJournal(transcript): Promise<Insights>
+    prompts.ts                      # MiniMax prompt template
+    types.ts                        # All interfaces
+  models/
+    User.ts
+    Journal.ts
+  components/
+    VoiceOrb.tsx                    # Pulsing circle — teal when listening, amber when agent speaks
+    LiveTranscript.tsx              # Scrolling real-time captions
+    MoodBadge.tsx                   # Emoji + score + label
+    MoodChart.tsx                   # Line chart — mood over 14 days
+    JournalCard.tsx                 # Summary card for history list
+    ThemeTags.tsx                   # Soft pill tags
+    WinsCard.tsx                    # Highlighted achievements
+    StreakDisplay.tsx               # "Day 12 🔥"
+    UserSelector.tsx                # Demo resident picker
+    ProcessingScreen.tsx            # Post-conversation loading animation
+```
+
+## Core Data Flow
+```
+1. Resident taps "Start Journal"
+2. → fetch /api/signed-url → get ElevenLabs signed URL
+3. → conversation.startSession({ signedUrl })
+4. → Voice conversation happens (3-5 min)
+5. → onMessage accumulates transcript[] in React state
+6. → Resident taps "End Journal"
+7. → conversation.endSession()
+8. → POST /api/journals with { userId, transcript, conversationId, durationSecs }
+9. → API route sends transcript to MiniMax for analysis
+10. → MiniMax returns structured insights (mood, themes, wins, summary)
+11. → Save journal + insights to MongoDB
+12. → Return journal._id to client
+13. → Redirect to /journal/[id] — show the beautiful entry
+```
+
+## MiniMax Integration
+- Base URL: https://api.minimaxi.chat/v1
+- LLM: POST /text/chatcompletion_v2 (model: abab6.5s-chat)
+- Auth: Authorization: Bearer {MINIMAX_API_KEY}
+- Always request JSON only — no markdown wrapping
+- Wrap in try/catch with mock fallback
+- The analysis prompt extracts: mood (1-10 + label), summary (first-person, 2-3 sentences), themes[], wins[], struggles[], people_mentioned[], concern_level
+
+## MongoDB Schemas
+- **users**: { name, avatar, houseId, movedIn, currentStreak, totalJournals }
+- **journals**: { userId, userName, date, conversationId, durationSecs, transcript[{role, text, timestamp}], insights{mood, summary, themes, wins, struggles, people_mentioned, looking_forward_to, concern_level, conversation_quality}, createdAt }
+
+## Tone Rules (for any AI-generated text in the UI)
+- Warm, genuine, British English
+- "Your day" not "Your journal entry"
+- "How you felt" not "Mood assessment"
+- Celebrate wins naturally — no generic "Great job!"
+- NEVER mention prison, offending, criminal records
+- NEVER use therapy language — "boundaries", "triggers", "coping mechanisms"
+- Use: "brilliant", "well done", "nice one", "sounds tough"
+
+## The Voice Orb (Hero Component)
+The centerpiece of the journal page. A circular element that:
+- Rests as a static teal circle when idle
+- Pulses/breathes gently when connected but silent
+- Expands/contracts with audio input amplitude when resident speaks (teal)
+- Switches to amber pulse when agent is speaking
+- Use CSS animations as baseline, upgrade to Web Audio API frequency data if time
+- Min size: 120px, max pulse: 180px
+- Center of screen, with generous whitespace around it
+
+## Code Rules
+- Server Components default. Client ONLY for: VoiceOrb, LiveTranscript, journal session page, MoodChart
+- ALL external API calls happen in API routes, never on client
+- MongoDB singleton cached on globalThis
+- All API responses: { success: boolean, data?: T, error?: string }
+- Zod validation on POST inputs
+- Keep components under 80 lines
+- Async/await everywhere, no .then chains
+
+## Demo Seed Data
+Create 15 days of journal data for Jay showing a realistic arc:
+- Days 1-3: Brief entries, mood 4-5, themes: "uncertainty", "adjusting"
+- Days 4-7: Opening up more, mood 5-6, themes: "job search", "routine"
+- Day 8: Bad day, mood 3, themes: "loneliness", "missing family"
+- Days 9-12: Recovery, mood 5-7, themes: "job progress", "peer support", "forklift training"
+- Days 13-15: Positive trend, mood 7-8, themes: "confidence", "community", "looking forward"
+
+Also create 3-5 entries each for Marcus (thriving), Lisa (variable), Danny (just starting).
+
+## Environment Variables
+```
+ELEVENLABS_API_KEY=your-api-key
+NEXT_PUBLIC_AGENT_ID=your-agent-id
+MINIMAX_API_KEY=your-api-key
+MINIMAX_GROUP_ID=your-group-id
+MONGODB_URI=your-mongodb-atlas-uri
+```
